@@ -1,0 +1,8 @@
+pupil-apriltags
+numpy
+scipy
+matplotlib
+pyyaml
+# ROS2 deps (install via apt, not pip):
+#   ros-humble-cv-bridge
+#   ros-humble-rclpy

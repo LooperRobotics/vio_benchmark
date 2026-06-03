@@ -1,0 +1,20 @@
+ros:
+  vio_topic:         /camera/camera/vio_20hz
+  image_topic:       /camera/camera/infra1/image_rect_raw
+  static_tf_topic:   /tf_static
+  camera_info_topic: /camera/camera/infra1/camera_info
+  body_frame:        camera_camera_imu
+  camera_frame:      camera_camera_left
+
+apriltag:
+  target_type: aprilgrid
+  tagFamily:   t36h11
+  tagRows:     6
+  tagCols:     6
+  tagSize:     0.055
+  tagSpacing:  0.3
+  codeOffset:  0
+
+output:
+  results_dir:  results/
+  vio_log_file: vio_poses.csv
