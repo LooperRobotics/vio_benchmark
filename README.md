@@ -51,6 +51,8 @@ IDLE → COLLECT_START → RUNNING → COLLECT_END → DONE
 
 ## Configuration (`config.yaml`)
 
+The config.yaml files for A200 and A500 are provided, and they correspond one-to-one with the model numbers in the lower left corner of the calibration board.
+
 ```yaml
 ros:
   vio_topic:         /camera/camera/vio_20hz       # PoseStamped
