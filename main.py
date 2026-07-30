@@ -47,6 +47,32 @@ _HINTS = {
     DONE:          'Processing — please wait.',
 }
 
+# image encodings accepted on image_topic
+SUPPORTED_ENCODINGS = ('mono8', 'nv12')
+
+
+def _nv12_luma(msg):
+    """
+    Extract the Y (luma) plane of an NV12 image as a contiguous uint8 array.
+
+    NV12 stores a full-resolution Y plane followed by a half-resolution
+    interleaved UV plane, so the buffer holds height * 1.5 rows. AprilGrid
+    detection only needs luma, so chroma is dropped.
+    """
+    buf    = np.frombuffer(msg.data, dtype=np.uint8)
+    stride = msg.step if msg.step >= msg.width else msg.width
+
+    # Most publishers set height to the luma height; some report the full
+    # buffer height (height * 3 / 2) instead.
+    h = msg.height
+    if len(buf) < stride * h * 3 // 2:
+        h = msg.height * 2 // 3
+    if h <= 0 or len(buf) < stride * h:
+        raise ValueError(f'nv12 buffer too small: {len(buf)} bytes for '
+                         f'{msg.width}x{msg.height} (step={msg.step})')
+
+    return np.ascontiguousarray(buf[:stride * h].reshape(h, stride)[:, :msg.width])
+
 
 class VIOBenchmark(Node):
 
@@ -57,6 +83,7 @@ class VIOBenchmark(Node):
 
         self._state      = IDLE
         self._lock       = threading.Lock()
+        self._last_encoding = None   # log the encoding once, and on change
         self._vio_active = True   # set False when file should close
 
         # data buffers
@@ -157,6 +184,29 @@ class VIOBenchmark(Node):
 
         self._print_state()
 
+    # ── image decoding ────────────────────────────────────────────────────────
+
+    def _to_gray(self, msg):
+        """
+        sensor_msgs/Image → single-channel uint8, as the AprilGrid detector
+        expects. Only mono8 and nv12 are supported; cv_bridge does not know
+        nv12, so its luma plane is unpacked by hand.
+        """
+        enc = msg.encoding.lower()
+
+        if enc != self._last_encoding:
+            self._last_encoding = enc
+            self.get_logger().info(f'Image encoding: {msg.encoding} '
+                                   f'({msg.width}x{msg.height}, step={msg.step})')
+
+        if enc == 'nv12':
+            return _nv12_luma(msg)
+        if enc == 'mono8':
+            return self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+
+        raise ValueError(f'unsupported encoding — expected one of '
+                         f'{", ".join(SUPPORTED_ENCODINGS)}')
+
     # ── ROS callbacks ─────────────────────────────────────────────────────────
 
     def _img_cb(self, msg):
@@ -166,9 +216,13 @@ class VIOBenchmark(Node):
             return
 
         stamp_ns = _stamp_ns(msg.header.stamp)
-        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        if img.dtype != np.uint8:
-            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        try:
+            img = self._to_gray(msg)
+        except Exception as e:
+            self.get_logger().error(
+                f'Cannot decode image (encoding={msg.encoding!r}): {e}',
+                throttle_duration_sec=5.0)
+            return
 
         with self._lock:
             if self._state == COLLECT_START:
@@ -352,7 +406,7 @@ def _stamp_ns(stamp):
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else 'config.yaml'
+    config_path = sys.argv[1] if len(sys.argv) > 1 else 'config_A500.yaml'
     if not os.path.exists(config_path):
         print(f'Config file not found: {config_path}')
         sys.exit(1)

@@ -24,14 +24,14 @@ Evaluate VIO accuracy using an AprilTag calibration board and ROS2.
 docker build -t vio_benchmark .
 
 # run (mounts this directory into the container)
-./run.sh python3 main.py
+./run.sh python3 main.py config_A500.yaml
 ```
 
 ### Run directly
 
 ```bash
 source /opt/ros/humble/setup.bash
-python3 main.py          # uses config.yaml in current directory
+python3 main.py          # uses config_A500.yaml in current directory defaultly
 python3 main.py my.yaml  # custom config
 ```
 
@@ -55,8 +55,8 @@ The config.yaml files for A200 and A500 are provided, and they correspond one-to
 
 ```yaml
 ros:
-  vio_topic:         /camera/camera/vio_20hz       # PoseStamped
-  image_topic:       /camera/camera/infra1/image_rect_raw
+  vio_topic:         /camera/camera/vio_image       # PoseStamped
+  image_topic:       /camera/camera/infra1/image_rect_raw   # Image, mono8 or nv12
   static_tf_topic:   /tf_static
   camera_info_topic: /camera/camera/infra1/camera_info
   body_frame:        camera_camera_imu             # parent frame of T_imu_cam
@@ -74,6 +74,19 @@ output:
   results_dir:  results/
   vio_log_file: vio_poses.csv
 ```
+
+### Image encodings
+
+`image_topic` must be `sensor_msgs/msg/Image` (compressed topics are not
+supported) with one of these encodings:
+
+| Encoding | Handling |
+|---|---|
+| `mono8` | used directly |
+| `nv12` | the Y (luma) plane is unpacked, chroma is dropped |
+
+Any other encoding is rejected with an error on every frame — the AprilGrid
+detector needs single-channel 8-bit luma.
 
 ## Output
 
