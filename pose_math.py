@@ -127,14 +127,25 @@ def align_frames(april_poses, vio_log, T_imu_cam, min_frames=5):
         n_used = int(mask.sum())
         print(f'[ALIGN] iter {iteration+1}: {n_used} inliers (dropped {mask.size - n_used} outliers)')
 
-    # final quality report (mirrors evo_ape -r full -a)
+    # final quality report (mirrors evo_ape -r {full,trans_part,angle_deg} -a)
     traj_est_final = copy.deepcopy(traj_est)
     traj_est_final.transform(T_board_world)
-    ape_final = APE(PoseRelation.full_transformation)
-    ape_final.process_data((traj_ref, traj_est_final))
-    s = ape_final.get_all_statistics()
-    print(f'[ALIGN] final APE (full, {n_used} frames): '
-          f'rmse={s["rmse"]:.4f}  mean={s["mean"]:.4f}  max={s["max"]:.4f}')
+
+    def _ape_stats(relation):
+        ape = APE(relation)
+        ape.process_data((traj_ref, traj_est_final))
+        return ape.get_all_statistics()
+
+    s     = _ape_stats(PoseRelation.full_transformation)
+    s_ate = _ape_stats(PoseRelation.translation_part)
+    s_are = _ape_stats(PoseRelation.rotation_angle_deg)
+    print(f'[ALIGN] final APE ({n_used} frames):')
+    print(f'        full : rmse={s["rmse"]:.4f}     mean={s["mean"]:.4f}     '
+          f'median={s["median"]:.4f}     max={s["max"]:.4f}')
+    print(f'        ATE  : rmse={s_ate["rmse"]:.4f} m   mean={s_ate["mean"]:.4f} m   '
+          f'median={s_ate["median"]:.4f} m   max={s_ate["max"]:.4f} m')
+    print(f'        ARE  : rmse={s_are["rmse"]:.4f} deg mean={s_are["mean"]:.4f} deg '
+          f'median={s_are["median"]:.4f} deg max={s_are["max"]:.4f} deg')
 
     return T_board_world, n_used
 

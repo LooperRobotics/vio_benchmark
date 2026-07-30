@@ -1,5 +1,5 @@
 ros:
-  vio_topic:         /camera/camera/vio_20hz
+  vio_topic:         /camera/camera/vio_image
   image_topic:       /camera/camera/infra1/image_rect_raw
   static_tf_topic:   /tf_static
   camera_info_topic: /camera/camera/infra1/camera_info
