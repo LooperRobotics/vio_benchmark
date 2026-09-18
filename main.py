@@ -22,12 +22,13 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from tf2_msgs.msg import TFMessage
 from cv_bridge import CvBridge
 
 from apriltag_grid import AprilGridDetector
+from undistort import Undistorter, MODE_OFF, parse_mode
 from pose_math import (mat4_from_ros_pose, mat4_from_tf,
                        align_frames, compute_ate, compute_trajectory_length)
 from visualizer import plot_results
@@ -47,8 +48,43 @@ _HINTS = {
     DONE:          'Processing — please wait.',
 }
 
-# image encodings accepted on image_topic
+# image encodings accepted on a raw image_topic
 SUPPORTED_ENCODINGS = ('mono8', 'nv12')
+
+# ROS message types image_topic may carry
+RAW_TYPE        = 'sensor_msgs/msg/Image'
+COMPRESSED_TYPE = 'sensor_msgs/msg/CompressedImage'
+
+# how long to wait for the publisher to appear in the graph when
+# image.compressed is 'auto' (seconds)
+TYPE_LOOKUP_TIMEOUT = 2.0
+
+_COMPRESSED_WORDS = ('true', 'yes', 'on', '1', 'compressed')
+_RAW_WORDS        = ('false', 'no', 'off', '0', 'raw')
+
+
+def _looks_compressed(topic):
+    """image_transport convention: <base>/compressed, <base>/compressedDepth."""
+    return topic.rstrip('/').rsplit('/', 1)[-1].lower().startswith('compressed')
+
+
+def _decode_compressed(msg):
+    """
+    sensor_msgs/CompressedImage → single-channel uint8.
+
+    The payload is a whole JPEG/PNG file, so OpenCV decodes it directly;
+    IMREAD_GRAYSCALE collapses colour formats to luma for us.
+    """
+    fmt = (msg.format or '').lower()
+    if 'compresseddepth' in fmt:
+        raise ValueError('compressedDepth is not supported — it is a depth map '
+                         'behind a custom header, not a luma image')
+
+    img = cv2.imdecode(np.frombuffer(msg.data, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f'cv2.imdecode failed on {len(msg.data)} bytes '
+                         f'(format={msg.format!r})')
+    return img
 
 
 def _nv12_luma(msg):
@@ -96,6 +132,17 @@ class VIOBenchmark(Node):
         self._K        = None   # camera matrix 3x3
         self._D        = None   # distortion coefficients
         self._T_imu_cam = None  # 4x4, pose of camera in IMU frame
+        self._undistorter = None  # built from the first CameraInfo message
+        self._image_size  = None  # (w, h) from CameraInfo
+
+        # distortion is removed before PnP unless explicitly disabled;
+        # 'auto' picks image rectification or corner undistortion per lens model
+        img_cfg = cfg.get('image', {}) or {}
+        try:
+            self._undistort_mode = parse_mode(img_cfg.get('undistort', True))
+        except ValueError as e:
+            self.get_logger().warn(f'{e} — using auto')
+            self._undistort_mode = 'auto'
 
         # AprilGrid detector
         ap = cfg['apriltag']
@@ -123,7 +170,11 @@ class VIOBenchmark(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.create_subscription(Image,       ros['image_topic'],       self._img_cb,    10)
+        self._compressed = self._resolve_image_type(
+            ros['image_topic'], img_cfg.get('compressed', 'auto'))
+        img_type = CompressedImage if self._compressed else Image
+
+        self.create_subscription(img_type,    ros['image_topic'],       self._img_cb,    10)
         self.create_subscription(PoseStamped, ros['vio_topic'],         self._vio_cb,    10)
         self.create_subscription(TFMessage,   ros['static_tf_topic'],   self._tf_cb,     _tf_qos)
         self.create_subscription(CameraInfo,  ros['camera_info_topic'], self._caminfo_cb, 1)
@@ -184,14 +235,84 @@ class VIOBenchmark(Node):
 
         self._print_state()
 
+    # ── image transport ───────────────────────────────────────────────────────
+
+    def _resolve_image_type(self, topic, mode):
+        """
+        True if `topic` carries CompressedImage, False for raw Image.
+
+        `mode` true/false forces the choice; 'auto' (the default) asks the ROS
+        graph for the advertised type, since subscribing with the wrong type
+        simply never matches the publisher and no frame ever arrives. When the
+        publisher is not up yet, fall back to the /compressed naming convention.
+        """
+        if isinstance(mode, bool):
+            chosen = mode
+        else:
+            word = str(mode).strip().lower()
+            if word in _COMPRESSED_WORDS:
+                chosen = True
+            elif word in _RAW_WORDS:
+                chosen = False
+            else:
+                if word != 'auto':
+                    self.get_logger().warn(
+                        f'image.compressed={mode!r} not understood — using auto')
+                chosen = self._probe_image_type(topic)
+
+        self.get_logger().info(
+            f'Image transport: {COMPRESSED_TYPE if chosen else RAW_TYPE} '
+            f'on {topic}')
+        return chosen
+
+    def _probe_image_type(self, topic):
+        """Ask the graph what `topic` is advertised as; None-safe, never raises."""
+        try:
+            resolved = self.resolve_topic_name(topic)
+        except Exception:
+            resolved = topic
+
+        deadline = time.time() + TYPE_LOOKUP_TIMEOUT
+        while True:
+            try:
+                graph = self.get_topic_names_and_types()
+            except Exception:
+                graph = []
+            for name, types in graph:
+                if name != resolved:
+                    continue
+                if COMPRESSED_TYPE in types:
+                    return True
+                if RAW_TYPE in types:
+                    return False
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+
+        guess = _looks_compressed(resolved)
+        self.get_logger().warn(
+            f'No publisher on {resolved} after {TYPE_LOOKUP_TIMEOUT:g}s — '
+            f'assuming {COMPRESSED_TYPE if guess else RAW_TYPE} from the topic '
+            f'name. Set image.compressed explicitly if that is wrong.')
+        return guess
+
     # ── image decoding ────────────────────────────────────────────────────────
 
     def _to_gray(self, msg):
         """
-        sensor_msgs/Image → single-channel uint8, as the AprilGrid detector
-        expects. Only mono8 and nv12 are supported; cv_bridge does not know
-        nv12, so its luma plane is unpacked by hand.
+        Image message → single-channel uint8, as the AprilGrid detector expects.
+
+        CompressedImage is decoded by OpenCV. For a raw Image only mono8 and
+        nv12 are supported; cv_bridge does not know nv12, so its luma plane is
+        unpacked by hand.
         """
+        if self._compressed:
+            if msg.format != self._last_encoding:
+                self._last_encoding = msg.format
+                self.get_logger().info(f'Image format: {msg.format} '
+                                       f'({len(msg.data)} bytes)')
+            return _decode_compressed(msg)
+
         enc = msg.encoding.lower()
 
         if enc != self._last_encoding:
@@ -219,8 +340,9 @@ class VIOBenchmark(Node):
         try:
             img = self._to_gray(msg)
         except Exception as e:
+            kind = getattr(msg, 'format', None) or getattr(msg, 'encoding', '?')
             self.get_logger().error(
-                f'Cannot decode image (encoding={msg.encoding!r}): {e}',
+                f'Cannot decode image ({kind!r}): {e}',
                 throttle_duration_sec=5.0)
             return
 
@@ -267,44 +389,90 @@ class VIOBenchmark(Node):
         with self._lock:
             if self._K is not None:
                 return
-            self._K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-            self._D = np.array(msg.d, dtype=np.float64)
+            K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+            D = np.array(msg.d, dtype=np.float64)
+
+        size = (msg.width, msg.height)
+        und = None
+        if self._undistort_mode != MODE_OFF:
+            try:
+                und = Undistorter(K, D, msg.distortion_model,
+                                  size=size, mode=self._undistort_mode)
+            except Exception as e:
+                self.get_logger().error(
+                    f'Cannot set up undistortion from camera_info '
+                    f'(model={msg.distortion_model!r}): {e} — using raw images')
+                und = None
+
+        with self._lock:
+            self._K = K
+            self._D = D
+            self._undistorter = und
+            self._image_size = size
+
         self.get_logger().info(
-            f'Camera intrinsics: fx={self._K[0,0]:.1f} fy={self._K[1,1]:.1f} '
-            f'cx={self._K[0,2]:.1f} cy={self._K[1,2]:.1f}'
+            f'Camera intrinsics: fx={K[0,0]:.1f} fy={K[1,1]:.1f} '
+            f'cx={K[0,2]:.1f} cy={K[1,2]:.1f}'
         )
+        self.get_logger().info(
+            und.describe(size) if und is not None
+            else 'undistortion disabled (image.undistort = false)')
 
     # ── background processing ─────────────────────────────────────────────────
 
     def _calib_snapshot(self):
-        """Return a thread-safe snapshot of calibration data, or (None,None,None)."""
+        """Thread-safe snapshot of calibration data (None entries if not received)."""
         with self._lock:
             K          = self._K.copy()        if self._K is not None        else None
             D          = self._D.copy()        if self._D is not None        else None
             T_imu_cam  = self._T_imu_cam.copy() if self._T_imu_cam is not None else None
-        return K, D, T_imu_cam
+            und        = self._undistorter
+        return K, D, und, T_imu_cam
 
     def _detect_frames(self, frames, label):
-        K, D, _ = self._calib_snapshot()
+        K, D, und, _ = self._calib_snapshot()
         if K is None:
             print(f'[ERROR] No camera intrinsics for {label} detection. '
                   'Check camera_info_topic.')
             return []
-        # save first frame for visual inspection
+
+        # remove distortion — from the frame or from the corners, whichever
+        # suits the lens — so PnP runs on a distortion-free camera
+        pts_fn = dist_fn = None
+        if und is not None and und.active:
+            with self._lock:
+                size = self._image_size
+            print(f'[{label}] {und.describe(size)}')
+            K, D = und.K, und.D
+            prep = und.undistort
+            if und.mode == 'points':
+                pts_fn, dist_fn = und.undistort_points, und.distort_points
+        else:
+            def prep(img):
+                return img
+
+        # save first frame (as fed to the detector) for visual inspection
         out_dir = self.cfg['output']['results_dir']
         if frames:
-            _, sample = frames[0]
+            sample = prep(frames[0][1])
             dbg_path = os.path.join(out_dir, f'debug_{label.lower()}_frame0.png')
             cv2.imwrite(dbg_path, sample)
             print(f'[{label}] sample frame: shape={sample.shape} dtype={sample.dtype} '
                   f'min={sample.min()} max={sample.max()} → saved {dbg_path}')
 
-        poses = []
+        poses, stats = [], {}
         for stamp_ns, img in frames:
-            T_cam_board = self._detector.detect_and_solve(img, K, D)
+            T_cam_board = self._detector.detect_and_solve(
+                prep(img), K, D, undistort_points=pts_fn,
+                distort_points=dist_fn, stats=stats)
             if T_cam_board is not None:
                 poses.append((stamp_ns, T_cam_board))
+
         print(f'[{label}] AprilGrid detected in {len(poses)}/{len(frames)} frames')
+        dropped = ', '.join(f'{k}={v}' for k, v in sorted(stats.items())
+                            if k != 'ok' and v)
+        if dropped:
+            print(f'[{label}] frames dropped at: {dropped}')
         return poses
 
     def _bg_detect_start(self):

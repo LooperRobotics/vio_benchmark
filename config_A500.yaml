@@ -6,6 +6,11 @@ ros:
   body_frame:        camera_camera_imu
   camera_frame:      camera_camera_left
 
+image:
+  undistort:  auto   # auto | image | points | false — remove distortion using camera_info
+                     #   auto: 'image' for pinhole lenses, 'points' for fisheye
+  compressed: auto   # auto | true | false — message type on image_topic
+
 apriltag:
   target_type: aprilgrid
   tagFamily:   t36h11
